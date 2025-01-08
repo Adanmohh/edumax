@@ -1,6 +1,7 @@
 # my_app/schemas.py
 from pydantic import BaseModel
 from typing import Optional, List
+from datetime import datetime
 
 class UserCreate(BaseModel):
     username: str
@@ -11,6 +12,31 @@ class UserCreate(BaseModel):
 class SchoolCreate(BaseModel):
     name: str
     session_token: str
+
+class CurriculumBase(BaseModel):
+    name: str
+    school_id: int
+    file_path: str
+    vector_key: Optional[str] = ""
+    created_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+class CurriculumResponse(BaseModel):
+    id: int
+    name: str
+    school_id: int
+    file_path: str
+    vector_key: str
+    created_at: datetime
+    has_embeddings: bool
+
+    class Config:
+        from_attributes = True
+
+class CurriculumList(BaseModel):
+    curricula: List[CurriculumResponse]
 
 class CurriculumIngest(BaseModel):
     """Schema for ingesting curriculum into vector store"""

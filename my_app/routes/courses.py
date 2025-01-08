@@ -1,7 +1,9 @@
 # my_app/routes/courses.py
 import uuid
 import json
-from fastapi import APIRouter, Body, Depends
+import sys
+import traceback
+from fastapi import APIRouter, Body, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from typing import Optional
@@ -46,7 +48,15 @@ async def create_course(
             "course_id": modules_created.course_id,
             "modules": json.loads(modules_created.modules_data)
         }
+    except HTTPException as he:
+        print(f"HTTP Exception in create_course: {he.detail}", file=sys.stderr)
+        return JSONResponse(
+            {"error": he.detail},
+            status_code=he.status_code
+        )
     except Exception as e:
+        print(f"Unexpected error in create_course: {str(e)}", file=sys.stderr)
+        print(f"Error traceback: {traceback.format_exc()}", file=sys.stderr)
         return JSONResponse(
             {"error": f"Failed to create course: {str(e)}"},
             status_code=500
@@ -126,6 +136,45 @@ async def finalize_course(
     except Exception as e:
         return JSONResponse(
             {"error": f"Failed to finalize course: {str(e)}"},
+            status_code=500
+        )
+
+@router.get("/schools/{school_id}/courses")
+def get_school_courses(
+    school_id: int,
+    session_token: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Get all courses for a specific school
+    """
+    if not session_token:
+        return JSONResponse({"error": "Session token required"}, status_code=400)
+
+    user = login_required(session_token, db)
+    if not user:
+        return JSONResponse({"error": "Not logged in"}, status_code=401)
+
+    # Check if user has access to this school
+    if user.role != "superadmin" and user.school_id != school_id:
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
+
+    try:
+        # Query courses filtered by school_id
+        courses = db.query(Course).filter(Course.school_id == school_id).all()
+        
+        return [
+            {
+                "id": course.id,
+                "title": course.title,
+                "duration_weeks": course.duration_weeks,
+                "is_finalized": course.is_finalized
+            }
+            for course in courses
+        ]
+    except Exception as e:
+        return JSONResponse(
+            {"error": f"Failed to get courses: {str(e)}"},
             status_code=500
         )
 

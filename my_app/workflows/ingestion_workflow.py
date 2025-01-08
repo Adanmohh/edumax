@@ -7,7 +7,8 @@ from llama_index.core import (
     Settings,
 )
 from llama_index.core.indices import VectorStoreIndex
-from llama_index.readers.file import PDFReader
+from llama_index.readers.docling import DoclingReader
+from docling import document_converter
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.core.vector_stores.types import VectorStore
@@ -42,6 +43,8 @@ def check_environment():
 def configure_llama_index():
     """Configure LlamaIndex settings"""
     check_environment()
+    # Suppress huggingface symlinks warning on Windows
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     Settings.llm = OpenAI(model=MODEL_NAME, api_key=OPENAI_API_KEY, temperature=0)
     Settings.embed_model = OpenAIEmbedding(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
@@ -90,10 +93,24 @@ class IngestionWorkflow:
         file_path = ev.file_path
         print(f"[Workflow] chunk_doc: reading from {file_path}")
 
-        # Configure reader with chunk size and overlap
-        reader = PDFReader()
-        documents = reader.load_data(file_path)
-
+        # Configure Docling reader
+        doc_converter = document_converter.DocumentConverter()
+        reader = DoclingReader(
+            export_type="markdown",  # Get structured markdown
+            doc_converter=doc_converter,
+            md_export_kwargs={"image_placeholder": ""}  # Skip images
+        )
+        
+        # Read and process document
+        print(f"[Workflow] Reading document: {file_path}")
+        documents = list(reader.lazy_load_data(file_path))
+        print(f"[Workflow] Extracted {len(documents)} document sections")
+        
+        # Log document structure
+        for i, doc in enumerate(documents):
+            print(f"[Workflow] Document {i+1} metadata: {doc.metadata}")
+            print(f"[Workflow] Document {i+1} preview: {doc.text[:200]}...")
+        
         return ChunksReadyEvent(
             file_path=file_path,
             collection_name=ev.collection_name,
@@ -150,7 +167,7 @@ class IngestionWorkflow:
         for i, doc in enumerate(ev.documents):
             try:
                 # Clean and validate document text
-                print(f"Getting embedding for document {i+1}")
+                print(f"Processing document {i+1}")
                 text = doc.text.strip()
                 if not text:
                     print(f"Skipping empty document {i+1}")
@@ -159,38 +176,52 @@ class IngestionWorkflow:
                 # Ensure text is valid UTF-8
                 text = text.encode('utf-8', errors='ignore').decode('utf-8')
                 
-                # Get embedding
-                embedding = embed_model.get_text_embedding(text)
-                print(f"Embedding generated successfully, length: {len(embedding)}")
+                # Split text into chunks of roughly 4000 tokens (half the limit)
+                # Approximate tokens by characters (1 token ≈ 4 chars)
+                chunk_size = 16000  # ~4000 tokens
+                chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+                print(f"Split document into {len(chunks)} chunks")
                 
-                # Convert embedding to numpy array
-                import numpy as np
-                embedding_array = np.array(embedding, dtype=np.float32)
-                
-                # Print first few values for debugging
-                print(f"First 5 values of embedding: {embedding_array[:5]}")
-                print(f"Min value: {embedding_array.min()}, Max value: {embedding_array.max()}")
-                
-                # Print document info
-                print(f"Document text length: {len(doc.text)}")
-                print(f"Document text preview: {doc.text[:100]}...")
-                
-                # Add point to collection with minimal payload
-                print(f"Adding point to Qdrant")
-                vector_list = embedding_array.tolist()
-                print(f"Vector type after tolist: {type(vector_list)}")
-                print(f"Vector length after tolist: {len(vector_list)}")
-                client.upsert(
-                    collection_name=ev.collection_name,
-                    points=[
-                        models.PointStruct(
-                            id=i,
-                            vector=embedding_array.tolist(),
-                            payload={"text": doc.text[:100]}  # Only use first 100 chars for testing
-                        )
-                    ]
-                )
-                print(f"Added document {i+1}/{len(ev.documents)}")
+                # Process each chunk
+                for chunk_idx, chunk in enumerate(chunks):
+                    print(f"Getting embedding for chunk {chunk_idx + 1}/{len(chunks)}")
+                    # Get embedding for chunk
+                    embedding = embed_model.get_text_embedding(chunk)
+                    print(f"Embedding generated successfully, length: {len(embedding)}")
+                    
+                    # Convert embedding to numpy array
+                    import numpy as np
+                    embedding_array = np.array(embedding, dtype=np.float32)
+                    
+                    # Print first few values for debugging
+                    print(f"First 5 values of embedding: {embedding_array[:5]}")
+                    print(f"Min value: {embedding_array.min()}, Max value: {embedding_array.max()}")
+                    
+                    # Print chunk info
+                    print(f"Chunk text length: {len(chunk)}")
+                    print(f"Chunk text preview: {chunk[:100]}...")
+                    
+                    # Add point to collection with minimal payload
+                    print(f"Adding point to Qdrant")
+                    vector_list = embedding_array.tolist()
+                    print(f"Vector type after tolist: {type(vector_list)}")
+                    print(f"Vector length after tolist: {len(vector_list)}")
+                    point_id = i * 1000 + chunk_idx  # Unique ID for each chunk
+                    client.upsert(
+                        collection_name=ev.collection_name,
+                        points=[
+                            models.PointStruct(
+                                id=point_id,
+                                vector=vector_list,
+                                payload={
+                                    "text": chunk,
+                                    "doc_id": i,
+                                    "chunk_idx": chunk_idx
+                                }
+                            )
+                        ]
+                    )
+                    print(f"Added chunk {chunk_idx + 1}/{len(chunks)} of document {i+1}/{len(ev.documents)}")
             except Exception as e:
                 print(f"Error processing document {i+1}: {str(e)}")
                 if hasattr(e, 'response'):

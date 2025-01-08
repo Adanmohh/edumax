@@ -20,6 +20,7 @@ def check_db_state():
                 print(f"  - ID: {curr.id}, Name: {curr.name}")
                 print(f"    File: {curr.file_path}")
                 print(f"    Vector Key: {curr.vector_key}")
+                print(f"    Created At: {curr.created_at}")
         
         # Check users
         users = db.query(User).all()

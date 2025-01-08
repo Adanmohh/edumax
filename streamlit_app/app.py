@@ -19,18 +19,35 @@ def login(username: str, password: str) -> Optional[str]:
             json={"username": username, "password": password}
         )
         
-        if response.status_code == 200:
-            data = response.json()
+        data = handle_api_response(response, "Login failed")
+        if data:
             # Store user info in session state
             st.session_state.user_role = data.get("role")
             st.session_state.user_school_id = data.get("school_id")
             st.session_state.token = data.get("token")
             return data.get("token")
-        else:
-            st.error(f"Login failed: {response.text}")
-            return None
+        return None
     except Exception as e:
         st.error(f"Login error: {str(e)}")
+        return None
+
+def handle_api_response(response, error_prefix: str = "Failed"):
+    """Handle API response and check for session expiration"""
+    if response.status_code == 401:
+        # Clear session state and force re-login
+        for key in st.session_state.keys():
+            del st.session_state[key]
+        st.error("Session expired. Please log in again.")
+        st.rerun()
+    elif response.status_code == 200:
+        return response.json()
+    else:
+        try:
+            error_data = response.json()
+            error_msg = error_data.get('error', 'Unknown error')
+        except json.JSONDecodeError:
+            error_msg = response.text if response.text else "Empty response from server"
+        st.error(f"{error_prefix}: {error_msg}")
         return None
 
 def get_schools():
@@ -39,10 +56,8 @@ def get_schools():
             f"{API_URL}/schools",
             params={"session_token": st.session_state.token}
         )
-        if response.status_code == 200:
-            return response.json()
-        st.error(f"Failed to fetch schools: {response.text}")
-        return []
+        result = handle_api_response(response, "Failed to fetch schools")
+        return result if result else []
     except Exception as e:
         st.error(f"Error fetching schools: {str(e)}")
         return []
@@ -53,10 +68,8 @@ def get_courses(school_id: int):
             f"{API_URL}/schools/{school_id}/courses",
             params={"session_token": st.session_state.token}
         )
-        if response.status_code == 200:
-            return response.json()
-        st.error(f"Failed to fetch courses: {response.text}")
-        return []
+        result = handle_api_response(response, "Failed to fetch courses")
+        return result if result else []
     except Exception as e:
         st.error(f"Error fetching courses: {str(e)}")
         return []
@@ -72,31 +85,15 @@ def get_curriculum(school_id: Optional[int] = None):
             params["school_id"] = school_id
             
         st.write(f"Debug: Fetching curriculum with params: {params}")
+        
         response = requests.get(
             f"{API_URL}/curriculum",
-            params=params
+            params=params,
+            timeout=10
         )
         
-        st.write(f"Debug: Response status: {response.status_code}")
-        st.write(f"Debug: Response headers: {dict(response.headers)}")
-        
-        if response.status_code == 200:
-            try:
-                data = response.json()
-                st.write(f"Debug: Response data: {data}")
-                return data
-            except json.JSONDecodeError as e:
-                st.error(f"Failed to parse JSON response: {str(e)}")
-                st.write(f"Debug: Raw response text: {response.text}")
-                return {"curricula": []}
-        else:
-            try:
-                error_data = response.json()
-                error_msg = error_data.get('error', 'Unknown error')
-            except json.JSONDecodeError:
-                error_msg = response.text if response.text else "Empty response from server"
-            st.error(f"Failed to fetch curriculum: {error_msg}")
-            return {"curricula": []}
+        result = handle_api_response(response, "Failed to fetch curriculum")
+        return result if result else {"curricula": []}
     except Exception as e:
         st.error(f"Error fetching curriculum: {str(e)}")
         st.write(f"Debug: Exception details: {type(e).__name__}: {str(e)}")
@@ -107,10 +104,25 @@ def create_course_step1():
     st.header("Create New Course")
     st.progress(33, text="Step 1/3: Basic Information")
     
+    # Get available curricula for the school
+    curriculum_data = get_curriculum(st.session_state.current_school['id'])
+    available_curricula = []
+    if curriculum_data and curriculum_data.get("curricula"):
+        available_curricula = [(c['id'], c['name']) for c in curriculum_data["curricula"]]
+    
     with st.form("course_basic_info"):
         title = st.text_input("Course Title")
         duration_weeks = st.number_input("Duration (weeks)", min_value=1, value=4)
-        curriculum_id = st.number_input("Curriculum ID (optional)", min_value=0, value=0)
+        
+        # Show curriculum dropdown instead of number input
+        curriculum_options = ["None"] + [f"{name} (ID: {id})" for id, name in available_curricula]
+        selected_curriculum = st.selectbox("Select Curriculum", curriculum_options)
+        
+        # Extract curriculum ID from selection
+        curriculum_id = 0
+        if selected_curriculum != "None":
+            curriculum_id = int(selected_curriculum.split("ID: ")[1].rstrip(")"))
+        
         submit = st.form_submit_button("Next")
         
         if submit and title:
@@ -125,74 +137,109 @@ def create_course_step1():
                         "session_token": st.session_state.token
                     }
                 )
-                if response.status_code == 200:
-                    data = response.json()
+                data = handle_api_response(response, "Failed to create course")
+                if data:
                     st.session_state.current_course = {
                         "id": data["course_id"],
                         "modules": data["modules"]
                     }
                     st.session_state.course_step = 2
                     st.rerun()
-                else:
-                    st.error(f"Failed to create course: {response.text}")
             except Exception as e:
                 st.error(f"Error creating course: {str(e)}")
 
 def create_course_step2():
-    """Course creation step 2: Modules"""
+    """Course creation step 2: AI Generation Progress"""
     st.header("Create New Course")
-    st.progress(66, text="Step 2/3: Modules")
+    st.progress(66, text="Step 2/3: Content Generation")
     
-    if "modules" not in st.session_state:
-        st.session_state.modules = []
-        modules_data = st.session_state.current_course.get("modules", [])
-        for module in modules_data:
-            st.session_state.modules.append({"name": module.get("name", "New Module")})
-    
-    st.subheader("Modules")
-    
-    # Display existing modules
-    for i, module in enumerate(st.session_state.modules):
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.session_state.modules[i]["name"] = st.text_input(
-                f"Module {i+1} Name",
-                value=module["name"],
-                key=f"module_{i}"
-            )
-        with col2:
-            if st.button("Remove", key=f"remove_{i}"):
-                st.session_state.modules.pop(i)
-                st.rerun()
-    
-    if st.button("Add Module"):
-        st.session_state.modules.append({"name": f"Module {len(st.session_state.modules)+1}"})
-        st.rerun()
-    
-    col1, col2 = st.columns([1, 1])
-    with col1:
-        if st.button("Back"):
-            st.session_state.course_step = 1
-            st.rerun()
-    with col2:
-        if st.button("Next"):
-            try:
-                response = requests.post(
-                    f"{API_URL}/courses/{st.session_state.current_course['id']}/modules",
-                    json={
-                        "modules": st.session_state.modules,
-                        "session_token": st.session_state.token
-                    }
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    st.session_state.current_course["lessons"] = data["lessons"]
-                    st.session_state.course_step = 3
+    # Get course details
+    try:
+        response = requests.get(
+            f"{API_URL}/courses/{st.session_state.current_course['id']}",
+            params={"session_token": st.session_state.token}
+        )
+        course = handle_api_response(response, "Failed to load course details")
+        
+        if course:
+            if course.get('curriculum_id'):
+                st.info("🤖 AI is generating course content based on the curriculum...")
+                
+                # Show generated modules
+                st.subheader("Generated Modules")
+                for module in course["modules"]:
+                    with st.expander(f"📚 {module['name']}"):
+                        if module.get('description'):
+                            st.write("Description:", module['description'])
+                        if module.get('learning_outcomes'):
+                            st.write("Learning Outcomes:")
+                            for outcome in json.loads(module['learning_outcomes']):
+                                st.write(f"• {outcome}")
+                        if module.get('prerequisites'):
+                            st.write("Prerequisites:")
+                            for prereq in json.loads(module['prerequisites']):
+                                st.write(f"• {prereq}")
+                
+                # Navigation buttons
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("Back"):
+                        st.session_state.course_step = 1
+                        st.rerun()
+                with col2:
+                    if st.button("Next"):
+                        st.session_state.course_step = 3
+                        st.rerun()
+            else:
+                # Manual module creation for courses without curriculum
+                if "modules" not in st.session_state:
+                    st.session_state.modules = []
+                    modules_data = st.session_state.current_course.get("modules", [])
+                    for module in modules_data:
+                        st.session_state.modules.append({"name": module.get("name", "New Module")})
+                
+                st.subheader("Modules")
+                for i, module in enumerate(st.session_state.modules):
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.session_state.modules[i]["name"] = st.text_input(
+                            f"Module {i+1} Name",
+                            value=module["name"],
+                            key=f"module_{i}"
+                        )
+                    with col2:
+                        if st.button("Remove", key=f"remove_{i}"):
+                            st.session_state.modules.pop(i)
+                            st.rerun()
+                
+                if st.button("Add Module"):
+                    st.session_state.modules.append({"name": f"Module {len(st.session_state.modules)+1}"})
                     st.rerun()
-                else:
-                    st.error(f"Failed to save modules: {response.text}")
-            except Exception as e:
-                st.error(f"Error saving modules: {str(e)}")
+                
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("Back"):
+                        st.session_state.course_step = 1
+                        st.rerun()
+                with col2:
+                    if st.button("Next"):
+                        try:
+                            response = requests.post(
+                                f"{API_URL}/courses/{st.session_state.current_course['id']}/modules",
+                                json={
+                                    "modules": st.session_state.modules,
+                                    "session_token": st.session_state.token
+                                }
+                            )
+                            data = handle_api_response(response, "Failed to save modules")
+                            if data:
+                                st.session_state.current_course["lessons"] = data["lessons"]
+                                st.session_state.course_step = 3
+                                st.rerun()
+                        except Exception as e:
+                            st.error(f"Error saving modules: {str(e)}")
+    except Exception as e:
+        st.error(f"Error loading course details: {str(e)}")
 
 def create_course_step3():
     """Course creation step 3: Review and Finalize"""
@@ -206,16 +253,41 @@ def create_course_step3():
             params={"session_token": st.session_state.token}
         )
         
-        if response.status_code == 200:
-            course = response.json()
+        course = handle_api_response(response, "Failed to load course details")
+        if course:
             st.write(f"Title: {course['title']}")
             st.write(f"Duration: {course['duration_weeks']} weeks")
+            
+            if course.get('curriculum_id'):
+                st.write("📚 Course generated from curriculum:")
+                if course.get('learning_objectives'):
+                    with st.expander("Learning Objectives"):
+                        for objective in json.loads(course['learning_objectives']):
+                            st.write(f"• {objective}")
+                if course.get('key_concepts'):
+                    with st.expander("Key Concepts"):
+                        for concept in json.loads(course['key_concepts']):
+                            st.write(f"• {concept}")
             
             st.subheader("Modules and Lessons")
             for module in course["modules"]:
                 with st.expander(f"📚 {module['name']}"):
+                    if module.get('description'):
+                        st.write("Description:", module['description'])
+                    
+                    st.write("Lessons:")
                     for lesson in module["lessons"]:
-                        st.write(f"📖 {lesson['name']}")
+                        with st.expander(f"📖 {lesson['name']}"):
+                            if lesson.get('description'):
+                                st.write("Description:", lesson['description'])
+                            if lesson.get('key_points'):
+                                st.write("Key Points:")
+                                for point in json.loads(lesson['key_points']):
+                                    st.write(f"• {point}")
+                            if lesson.get('activities'):
+                                st.write("Activities:")
+                                for activity in json.loads(lesson['activities']):
+                                    st.write(f"• {activity}")
             
             col1, col2 = st.columns([1, 1])
             with col1:
@@ -229,17 +301,14 @@ def create_course_step3():
                             f"{API_URL}/courses/{st.session_state.current_course['id']}/finalize",
                             json={"session_token": st.session_state.token}
                         )
-                        if response.status_code == 200:
+                        data = handle_api_response(response, "Failed to finalize course")
+                        if data:
                             st.success("Course finalized successfully!")
                             st.session_state.course_step = None
                             st.session_state.current_course = None
                             st.rerun()
-                        else:
-                            st.error(f"Failed to finalize course: {response.text}")
                     except Exception as e:
                         st.error(f"Error finalizing course: {str(e)}")
-        else:
-            st.error(f"Failed to load course details: {response.text}")
     except Exception as e:
         st.error(f"Error loading course details: {str(e)}")
 
@@ -322,11 +391,10 @@ def main():
                                     "session_token": st.session_state.token
                                 }
                             )
-                            if response.status_code == 200:
+                            data = handle_api_response(response, "Failed to create school")
+                            if data:
                                 st.success(f"School '{school_name}' created successfully!")
                                 st.rerun()
-                            else:
-                                st.error(f"Failed to create school: {response.text}")
                         except Exception as e:
                             st.error(f"Error creating school: {str(e)}")
         
@@ -414,9 +482,9 @@ def main():
                                 files=files,
                                 data=data
                             )
-                        
-                            if response.status_code == 200:
-                                upload_data = response.json()
+                            
+                            upload_data = handle_api_response(response, "Failed to upload curriculum")
+                            if upload_data:
                                 curriculum_id = upload_data.get("curriculum_id")
                                 st.success(f"Curriculum '{name}' uploaded successfully!")
                                 
@@ -432,19 +500,10 @@ def main():
                                         }
                                     )
                                     
-                                    if ingest_response.status_code == 200:
+                                    ingest_data = handle_api_response(ingest_response, "Failed to process curriculum")
+                                    if ingest_data:
                                         st.success("✨ Curriculum processed successfully!")
                                         st.rerun()
-                                    else:
-                                        error_data = ingest_response.json()
-                                        error_msg = error_data.get('error', 'Unknown error')
-                                        if "environment variables" in error_msg:
-                                            st.error("⚠️ Server configuration error: Missing required API keys. Please contact the administrator.")
-                                        else:
-                                            st.error(f"Failed to process curriculum: {error_msg}")
-                            else:
-                                error_data = response.json()
-                                st.error(f"Failed to upload curriculum: {error_data.get('error', 'Unknown error')}")
                         except Exception as e:
                             st.error(f"Upload error: {str(e)}")
         
@@ -455,11 +514,62 @@ def main():
             st.subheader("Available Curriculum")
             for item in response_data:
                 with st.expander(f"📑 {item['name']}"):
-                    st.write(f"File: {item['file_path']}")
-                    if item.get('vector_key'):
-                        st.success("✓ Processed with AI")
-                    else:
-                        st.warning("⚠ Not processed with AI")
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.write(f"File: {item['file_path']}")
+                        if item.get('vector_key'):
+                            st.success("✓ Processed with AI")
+                        else:
+                            st.warning("⚠ Not processed with AI")
+                        
+                        # Add PDF viewer and AI ingestion
+                        if item['file_path'].lower().endswith('.pdf'):
+                            try:
+                                with open(item['file_path'], "rb") as pdf_file:
+                                    pdf_bytes = pdf_file.read()
+                                    col_pdf, col_ai = st.columns([1, 1])
+                                    with col_pdf:
+                                        st.download_button(
+                                            label="View PDF",
+                                            data=pdf_bytes,
+                                            file_name=f"{item['name']}.pdf",
+                                            mime="application/pdf"
+                                        )
+                                    # Show AI ingestion button only if not processed
+                                    if not item.get('vector_key'):
+                                        with col_ai:
+                                            if st.button("🤖 Ingest with AI", key=f"ingest_{item['id']}"):
+                                                with st.spinner("Processing curriculum with AI..."):
+                                                    collection_name = f"school_{st.session_state.current_school['id']}_{item['id']}"
+                                                    ingest_response = requests.post(
+                                                        f"{API_URL}/curriculum/ingest",
+                                                        json={
+                                                            "curriculum_id": item['id'],
+                                                            "collection_name": collection_name,
+                                                            "session_token": st.session_state.token
+                                                        }
+                                                    )
+                                                    ingest_data = handle_api_response(ingest_response, "Failed to process curriculum")
+                                                    if ingest_data:
+                                                        st.success("✨ Curriculum processed successfully!")
+                                                        st.rerun()
+                            except Exception as e:
+                                st.error(f"Error loading PDF: {str(e)}")
+                    
+                    with col2:
+                        if st.button("🗑️ Delete", key=f"delete_{item['id']}"):
+                            try:
+                                response = requests.delete(
+                                    f"{API_URL}/curriculum/{item['id']}",
+                                    params={"session_token": st.session_state.token}
+                                )
+                                if response.status_code == 200:
+                                    st.success("Curriculum deleted successfully!")
+                                    st.rerun()
+                                else:
+                                    st.error("Failed to delete curriculum")
+                            except Exception as e:
+                                st.error(f"Error deleting curriculum: {str(e)}")
         else:
             st.info("No curriculum items found. Upload one to get started!")
 

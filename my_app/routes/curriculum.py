@@ -1,17 +1,20 @@
 
 # my_app/routes/curriculum.py
 import os
-import aiofiles
+import sys
 import uuid
+import aiofiles
+import traceback
 from typing import List, Optional
+from datetime import datetime
+
 from fastapi import APIRouter, File, UploadFile, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
 
 from ..database import get_db
 from ..models import Curriculum
-from ..schemas import CurriculumIngest
+from ..schemas import CurriculumIngest, CurriculumResponse
 from .auth import login_required
 from ..config import BASE_DIR
 from ..workflows.ingestion_workflow import (
@@ -23,12 +26,13 @@ from ..workflows.curriculum_discussion_workflow import (
     DiscussionResponse
 )
 
-router = APIRouter(prefix="/curriculum", tags=["curriculum"])
+router = APIRouter(prefix="/curriculum", tags=["Curriculum"])
 
 # Workflow instances
 discussion_workflow = CurriculumDiscussionWorkflow()
 
 # List and Search
+
 @router.get("")
 async def list_curricula(
     search: Optional[str] = Query(None),
@@ -36,50 +40,78 @@ async def list_curricula(
     session_token: str = Query(...),
     db: Session = Depends(get_db)
 ):
+    print("Starting list_curricula endpoint", file=sys.stderr)
     """List curricula with optional search and filtering"""
     print(f"Debug: Received request - search: {search}, school_id: {school_id}, token: {session_token}")
     
-    user = login_required(session_token, db)
-    if not user:
-        print("Debug: Authentication failed - user not found or invalid token")
-        return JSONResponse({"error": "Not logged in"}, status_code=401)
+    try:
+        print(f"Debug: About to check login with token: {session_token}")
+        user = login_required(session_token, db)
+        print(f"Debug: Login check result: {user}")
+        if not user:
+            print("Debug: Authentication failed - user not found or invalid token")
+            return JSONResponse({"error": "Not logged in"}, status_code=401)
 
-    print(f"Debug: Authenticated user - ID: {user.id}, Role: {user.role}, School: {user.school_id}")
+        print(f"Debug: Authenticated user - ID: {user.id}, Role: {user.role}, School: {user.school_id}")
+    except Exception as e:
+        print(f"Debug: Authentication error - {str(e)}")
+        traceback_str = traceback.format_exc()
+        print(f"Debug: Auth error traceback: {traceback_str}")
+        return JSONResponse(
+            content={
+                "error": f"Authentication error: {str(e)}",
+                "traceback": traceback_str,
+                "type": str(type(e))
+            },
+            status_code=500
+        )
 
     # Build query
     query = db.query(Curriculum)
-    
-    # Apply school filter based on user role
+
+    # Apply filters
     if user.role != "superadmin":
         query = query.filter(Curriculum.school_id == user.school_id)
-        print(f"Debug: Filtering by user's school_id: {user.school_id}")
     elif school_id:
         query = query.filter(Curriculum.school_id == school_id)
-        print(f"Debug: Filtering by provided school_id: {school_id}")
-    
-    # Apply search if provided
+        
     if search:
         query = query.filter(Curriculum.name.ilike(f"%{search}%"))
-        print(f"Debug: Applying search filter: {search}")
-    
-    curricula = query.all()
-    print(f"Debug: Found {len(curricula)} curriculum items")
-    
-    result = {
-        "curricula": [
-            {
-                "id": c.id,
-                "name": c.name,
-                "school_id": c.school_id,
-                "file_path": c.file_path,
-                "vector_key": c.vector_key,
-                "has_embeddings": bool(c.vector_key),
-                "created_at": c.created_at
-            } for c in curricula
-        ]
-    }
-    print(f"Debug: Returning response: {result}")
-    return result
+
+    # Execute query using SQLAlchemy ORM
+    print("Debug: Executing query", file=sys.stderr)
+    try:
+        curricula = query.all()
+        print(f"Debug: Found {len(curricula)} curricula", file=sys.stderr)
+        
+        # Convert to response format
+        curricula_list = []
+        for c in curricula:
+            print(f"Debug: Processing curriculum {c.id}", file=sys.stderr)
+            try:
+                curriculum_dict = {
+                    "id": c.id,
+                    "name": c.name,
+                    "school_id": c.school_id,
+                    "file_path": c.file_path,
+                    "vector_key": c.vector_key or "",
+                    "created_at": c.created_at.isoformat() if c.created_at else datetime.utcnow().isoformat(),
+                    "has_embeddings": bool(c.vector_key)
+                }
+                print(f"Debug: Processed curriculum: {curriculum_dict}", file=sys.stderr)
+                curricula_list.append(curriculum_dict)
+            except Exception as e:
+                print(f"Debug: Error processing curriculum {c.id}: {str(e)}", file=sys.stderr)
+                print(f"Debug: Processing error traceback: {traceback.format_exc()}", file=sys.stderr)
+                continue
+        
+        response_data = {"curricula": curricula_list}
+        print(f"Debug: Final response: {response_data}", file=sys.stderr)
+        return JSONResponse(content=response_data)
+    except Exception as e:
+        print(f"Debug: Error executing query: {str(e)}", file=sys.stderr)
+        print(f"Debug: Query error traceback: {traceback.format_exc()}", file=sys.stderr)
+        raise HTTPException(status_code=500, detail=f"Query error: {str(e)}")
 
 @router.get("/{curriculum_id}")
 async def get_curriculum(
@@ -99,13 +131,15 @@ async def get_curriculum(
     if user.role != "superadmin" and user.school_id != cur.school_id:
         return JSONResponse({"error": "Forbidden"}, status_code=403)
     
-    return {
-        "id": cur.id,
-        "name": cur.name,
-        "school_id": cur.school_id,
-        "has_embeddings": bool(cur.vector_key),
-        "created_at": cur.created_at
-    }
+    return CurriculumResponse(
+        id=cur.id,
+        name=cur.name,
+        school_id=cur.school_id,
+        file_path=cur.file_path,
+        vector_key=cur.vector_key,
+        created_at=cur.created_at or datetime.utcnow(),
+        has_embeddings=bool(cur.vector_key)
+    )
 
 # File Operations
 @router.post("/upload")
