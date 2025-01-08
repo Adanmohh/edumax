@@ -1,0 +1,93 @@
+# Cursor Configuration for Educational Platform
+
+# Include section - Files that Cursor should actively work with
+include:
+  # Python backend files
+  - "**/*.py"                   # All Python files
+  - "**/requirements.txt"       # Python dependencies
+  - "**/pyproject.toml"        # Python project configuration
+  - "**/*.pyi"                 # Python interface files
+
+  # Frontend files (Streamlit)
+  - "**/*.streamlit/*.py"      # Streamlit configuration files
+  - "**/*.streamlit/*.toml"    # Streamlit settings
+
+  # API and Configuration files
+  - "**/fastapi/**/*.py"       # FastAPI specific files
+  - "**/api/**/*.py"           # API endpoints
+  - "**/*.yaml"                # YAML configurations
+  - "**/*.yml"                 # Alternative YAML extension
+  - "**/*.json"                # JSON configurations
+  - "**/config/**/*"           # Configuration directory
+
+  # Database and Vector Store
+  - "**/models/*.py"           # Database models
+  - "**/schemas/*.py"          # Pydantic schemas
+  - "**/migrations/**/*.py"    # Database migrations
+  - "**/vector_store/**/*.py"  # Qdrant related code
+
+  # AI and LlamaIndex
+  - "**/ai/**/*.py"           # AI-related code
+  - "**/llamaindex/**/*.py"   # LlamaIndex implementations
+  - "**/prompts/**/*.py"      # AI prompt templates
+  - "**/embeddings/**/*.py"   # Embedding generation code
+
+  # Documentation
+  - "**/*.md"                 # Markdown documentation
+  - "**/docs/**/*"            # Documentation directory
+  - "**/*.rst"                # ReStructuredText docs
+
+# Ignore section - Files and directories Cursor should ignore
+ignore:
+  # Build and compilation artifacts
+  - "**/dist/**"              # Distribution directories
+  - "**/build/**"             # Build directories
+  - "**/__pycache__/**"       # Python cache
+  - "**/*.pyc"                # Compiled Python files
+  - "**/*.pyo"                # Optimized Python files
+  - "**/*.pyd"                # Python DLL files
+  - "**/.pytest_cache/**"     # Pytest cache
+  - "**/.coverage"            # Coverage reports
+  - "**/htmlcov/**"           # HTML coverage reports
+
+  # Development environments
+  - "**/venv/**"              # Python virtual environments
+  - "**/.env/**"              # Environment directory
+  - "**/.venv/**"             # Alternative virtual env name
+  - "**/env/**"               # Another common env name
+
+  # IDEs and editors
+  - "**/.idea/**"             # PyCharm
+  - "**/.vscode/**"           # VSCode
+  - "**/*.swp"                # Vim swap files
+  - "**/*.swo"                # Vim swap files
+  - "**/.DS_Store"            # macOS system files
+
+  # Version control
+  - "**/.git/**"              # Git directory
+  - "**/.gitignore"           # Git ignore file
+  - "**/.gitattributes"       # Git attributes
+
+  # Temporary and cache files
+  - "**/tmp/**"               # Temporary files
+  - "**/temp/**"              # Temporary directory
+  - "**/.cache/**"            # Cache directory
+  - "**/logs/**"              # Log files
+  - "**/*.log"                # Log files
+
+  # Vector store and database
+  - "**/vector_store/data/**" # Vector store data files
+  - "**/qdrant_storage/**"    # Qdrant storage
+  - "**/*.sqlite"             # SQLite database files
+  - "**/*.db"                 # Database files
+
+  # User uploads and media
+  - "**/uploads/**"           # User uploaded files
+  - "**/media/**"             # Media files
+  - "**/static/**/*.pdf"      # PDF files in static
+  - "**/static/**/*.doc*"     # Word documents in static
+
+  # Test data and fixtures
+  - "**/tests/data/**"        # Test data directory
+  - "**/fixtures/**"          # Test fixtures
+  - "**/test_data/**"         # Alternative test data name
