@@ -1,41 +1,36 @@
-# my_app/workflows/course_creation_workflow.py
-
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from ..database import SessionLocal
-from ..models import Course, Module, Lesson
+from fastapi import HTTPException
+from datetime import datetime
 import json
+
+from ..database import SessionLocal
+from ..models import Course, Module, Lesson, Curriculum
+from .curriculum_extraction_workflow import CurriculumExtractionWorkflow
+from .ai_outline_generator import AIOutlineGenerator
 
 ##########################
 # MODELS
 ##########################
 class StartCourseEvent(BaseModel):
-    """
-    This event triggers the workflow with basic course info.
-    """
+    """Initial event with basic course info"""
     school_id: int
     title: str
     duration_weeks: int
     curriculum_id: int  # optional; can be 0 if none
 
 class ModulesCreatedEvent(BaseModel):
-    """
-    After modules are created.
-    """
+    """After modules are created"""
     course_id: int
-    modules_data: str  # e.g. JSON list of {name:..}
+    modules_data: str  # JSON list of {name:..}
 
 class LessonsCreatedEvent(BaseModel):
-    """
-    After lessons are created for each module.
-    """
+    """After lessons are created"""
     course_id: int
     lessons_data: str
 
 class StopEvent(BaseModel):
-    """
-    Final event indicating workflow completion.
-    """
+    """Final completion event"""
     result: str
 
 ##########################
@@ -44,42 +39,139 @@ class StopEvent(BaseModel):
 class CourseCreationWorkflow:
     def __init__(self):
         self.ctx = {}
+        self.curriculum_extractor = CurriculumExtractionWorkflow()
+        self.ai_generator = AIOutlineGenerator()
 
     async def start_course(
         self, ev: StartCourseEvent
     ) -> ModulesCreatedEvent:
         """
-        Step 1: Create a Course record in DB, generate modules.
-        For example, we might create # of modules based on duration_weeks.
+        Step 1: Create Course with comprehensive curriculum context
         """
-        # We'll do a standard DB session local open for demonstration
         db = SessionLocal()
         try:
-            # create the course row
-            course = Course(
-                school_id=ev.school_id,
-                title=ev.title,
-                duration_weeks=ev.duration_weeks,
-                curriculum_id=ev.curriculum_id if ev.curriculum_id else None
-            )
-            db.add(course)
-            db.commit()
-            db.refresh(course)
-
-            # Suppose we create 'duration_weeks' modules by default
             modules_list = []
-            for i in range(ev.duration_weeks):
-                m = Module(name=f"Module_{i+1}", course_id=course.id)
-                db.add(m)
+            if ev.curriculum_id:
+                # Get curriculum info
+                curriculum = db.query(Curriculum).filter(Curriculum.id == ev.curriculum_id).first()
+                if not curriculum:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Curriculum not found"
+                    )
+                
+                if not curriculum.vector_key:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Curriculum has not been processed yet. Please run curriculum ingestion first via /curriculum/ingest endpoint"
+                    )
+                
+                try:
+                    # Extract comprehensive curriculum context
+                    curriculum_context = await self.curriculum_extractor.extract_comprehensive_context(
+                        collection_name=curriculum.vector_key,
+                        context_type='course'
+                    )
+                except HTTPException as he:
+                    raise HTTPException(
+                        status_code=he.status_code,
+                        detail=f"Failed to extract curriculum info: {he.detail}"
+                    )
+                
+                # Create course with comprehensive context
+                course = Course(
+                    school_id=ev.school_id,
+                    title=ev.title,
+                    duration_weeks=ev.duration_weeks,
+                    curriculum_id=ev.curriculum_id,
+                    # Basic context
+                    learning_objectives=json.dumps(curriculum_context.learning_objectives),
+                    key_concepts=json.dumps(curriculum_context.key_concepts),
+                    skill_level=curriculum_context.skill_level,
+                    # Enhanced context
+                    themes=json.dumps(curriculum_context.themes),
+                    progression_path=json.dumps(curriculum_context.progression_path),
+                    teaching_approach=json.dumps(curriculum_context.teaching_approach),
+                    core_competencies=json.dumps(curriculum_context.core_competencies),
+                    # Cache full context
+                    curriculum_context_cache=json.dumps(curriculum_context.dict()),
+                    last_context_update=curriculum_context.extraction_timestamp
+                )
+                db.add(course)
                 db.commit()
-                db.refresh(m)
-                modules_list.append({"id": m.id, "name": m.name})
+                db.refresh(course)
+                
+                # Generate modules using comprehensive context
+                total_modules = max(ev.duration_weeks, 3)
+                for i in range(total_modules):
+                    # Extract module-specific context
+                    module_context = await self.curriculum_extractor.extract_comprehensive_context(
+                        collection_name=curriculum.vector_key,
+                        context_type='module',
+                        parent_context_id=course.id,
+                        specific_focus=f"Module {i+1} content and structure"
+                    )
+                    
+                    # Generate module outline using combined context
+                    module_outline = await self.ai_generator.generate_module_outline(
+                        curriculum_context=curriculum_context,  # Base context
+                        module_number=i + 1,
+                        total_modules=total_modules
+                    )
+                    
+                    # Create module with context
+                    m = Module(
+                        course_id=course.id,
+                        name=module_outline.name,
+                        description=module_outline.description,
+                        learning_outcomes=json.dumps(module_outline.learning_outcomes),
+                        prerequisites=json.dumps(module_outline.prerequisites),
+                        estimated_duration=module_outline.estimated_duration,
+                        # Store module-specific context
+                        theme_context=json.dumps(module_context.themes),
+                        module_context_cache=json.dumps(module_context.dict())
+                    )
+                    db.add(m)
+                    db.commit()
+                    db.refresh(m)
+                    
+                    modules_list.append({
+                        "id": m.id,
+                        "name": m.name,
+                        "description": m.description,
+                        "learning_outcomes": module_outline.learning_outcomes,
+                        "prerequisites": module_outline.prerequisites,
+                        "estimated_duration": module_outline.estimated_duration,
+                        "themes": module_context.themes
+                    })
+            else:
+                # Create course without curriculum
+                course = Course(
+                    school_id=ev.school_id,
+                    title=ev.title,
+                    duration_weeks=ev.duration_weeks
+                )
+                db.add(course)
+                db.commit()
+                db.refresh(course)
 
-            # store the modules list as JSON
-            modules_data = json.dumps(modules_list)
+                # Create default modules
+                for i in range(ev.duration_weeks):
+                    m = Module(
+                        name=f"Module_{i+1}",
+                        course_id=course.id
+                    )
+                    db.add(m)
+                    db.commit()
+                    db.refresh(m)
+                    modules_list.append({
+                        "id": m.id,
+                        "name": m.name
+                    })
+
             return ModulesCreatedEvent(
                 course_id=course.id,
-                modules_data=modules_data
+                modules_data=json.dumps(modules_list)
             )
         finally:
             db.close()
@@ -88,38 +180,113 @@ class CourseCreationWorkflow:
         self, ev: ModulesCreatedEvent
     ) -> LessonsCreatedEvent:
         """
-        Step 2: For each module, create some default lessons
-        (e.g. 4 lessons per module).
+        Step 2: Create lessons using hierarchical context
         """
         db = SessionLocal()
         try:
             modules_list = json.loads(ev.modules_data)
-            course_id = ev.course_id
-
+            course = db.query(Course).filter(Course.id == ev.course_id).first()
             lessons_info = []
 
-            for mod_info in modules_list:
-                module_id = mod_info["id"]
-                # example: create 4 lessons per module
-                for i in range(1, 5):
-                    lesson = Lesson(
-                        module_id=module_id,
-                        name=f"Lesson_{i}",
-                        content=f"This is the content of Lesson_{i} in {mod_info['name']}"
+            if course and course.curriculum_id:
+                curriculum = db.query(Curriculum).filter(Curriculum.id == course.curriculum_id).first()
+                if not curriculum or not curriculum.vector_key:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid curriculum configuration"
                     )
-                    db.add(lesson)
-                    db.commit()
-                    db.refresh(lesson)
-                    lessons_info.append({
-                        "module_id": module_id,
-                        "lesson_id": lesson.id,
-                        "lesson_name": lesson.name
-                    })
+                
+                # Load course context from cache
+                course_context = json.loads(course.curriculum_context_cache)
+                
+                for mod_info in modules_list:
+                    module = db.query(Module).filter(Module.id == mod_info["id"]).first()
+                    if not module:
+                        continue
+                    
+                    # Load module context from cache
+                    module_context = json.loads(module.module_context_cache)
+                    
+                    # Generate 4 lessons per module
+                    for i in range(1, 5):
+                        # Extract lesson-specific context
+                        lesson_context = await self.curriculum_extractor.extract_comprehensive_context(
+                            collection_name=curriculum.vector_key,
+                            context_type='lesson',
+                            parent_context_id=module.id,
+                            specific_focus=f"{module.name} Lesson {i}"
+                        )
+                        
+                        # Generate lesson content using hierarchical context
+                        lesson_outline = await self.ai_generator.generate_lesson_outline(
+                            curriculum_context=lesson_context,
+                            module_name=module.name,
+                            lesson_number=i,
+                            total_lessons=4
+                        )
+                        
+                        content_sections = await self.ai_generator.generate_lesson_content(
+                            curriculum_context=lesson_context,
+                            lesson_outline=lesson_outline
+                        )
+                        
+                        full_content = "\n\n".join([
+                            f"# {section.title}\n\n{section.content}"
+                            for section in content_sections
+                        ])
+                        
+                        all_examples = []
+                        all_exercises = []
+                        for section in content_sections:
+                            all_examples.extend(section.examples)
+                            all_exercises.extend(section.exercises)
+                        
+                        lesson = Lesson(
+                            module_id=module.id,
+                            name=lesson_outline.name,
+                            description=lesson_outline.description,
+                            content=full_content,
+                            key_points=json.dumps(lesson_outline.key_points),
+                            activities=json.dumps(lesson_outline.activities),
+                            resources=json.dumps(lesson_outline.resources),
+                            assessment_ideas=json.dumps(lesson_outline.assessment_ideas),
+                            examples=json.dumps(all_examples),
+                            exercises=json.dumps(all_exercises),
+                            # Store lesson-specific context
+                            topic_context=json.dumps(lesson_context.themes),
+                            lesson_context_cache=json.dumps(lesson_context.dict())
+                        )
+                        db.add(lesson)
+                        db.commit()
+                        db.refresh(lesson)
+                        
+                        lessons_info.append({
+                            "module_id": module.id,
+                            "lesson_id": lesson.id,
+                            "lesson_name": lesson.name,
+                            "description": lesson.description
+                        })
+            else:
+                # Create default lessons without context
+                for mod_info in modules_list:
+                    for i in range(1, 5):
+                        lesson = Lesson(
+                            module_id=mod_info["id"],
+                            name=f"Lesson_{i}",
+                            content=f"Default content for Lesson_{i}"
+                        )
+                        db.add(lesson)
+                        db.commit()
+                        db.refresh(lesson)
+                        lessons_info.append({
+                            "module_id": mod_info["id"],
+                            "lesson_id": lesson.id,
+                            "lesson_name": lesson.name
+                        })
 
-            lessons_data = json.dumps(lessons_info)
             return LessonsCreatedEvent(
-                course_id=course_id,
-                lessons_data=lessons_data
+                course_id=ev.course_id,
+                lessons_data=json.dumps(lessons_info)
             )
         finally:
             db.close()
@@ -128,29 +295,23 @@ class CourseCreationWorkflow:
         self, ev: LessonsCreatedEvent
     ) -> StopEvent:
         """
-        Step 3: Mark the course as finalized (if desired).
-        Could also do more steps for assessments, etc.
+        Step 3: Finalize course creation
         """
         db = SessionLocal()
         try:
-            course_id = ev.course_id
-            course = db.query(Course).filter(Course.id == course_id).first()
+            course = db.query(Course).filter(Course.id == ev.course_id).first()
             if course:
-                # we won't forcibly set is_finalized in this step,
-                # but let's pretend we do for demonstration
                 course.is_finalized = True
                 db.commit()
 
             return StopEvent(
-                result=f"Course {course_id} created with modules/lessons. Finalized!"
+                result=f"Course {ev.course_id} created successfully with comprehensive curriculum context"
             )
         finally:
             db.close()
 
     async def run(self, ev: StartCourseEvent) -> str:
-        """
-        Run the workflow from start to finish
-        """
+        """Run complete workflow"""
         modules_created = await self.start_course(ev)
         lessons_created = await self.create_lessons(modules_created)
         stop = await self.finalize_course(lessons_created)
