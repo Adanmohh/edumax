@@ -4,7 +4,7 @@ import json
 from typing import Optional
 
 # Constants
-API_URL = "http://localhost:8001"  # Changed port to match edumax server
+API_URL = "http://localhost:8000"  # FastAPI server port
 
 # Session state initialization
 if 'token' not in st.session_state:
