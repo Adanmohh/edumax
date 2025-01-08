@@ -1,12 +1,27 @@
 # my_app/workflows/ingestion_workflow.py
 import os
+import sys
+import numpy as np
+from datetime import datetime
 from typing import List
 from llama_index.core import (
     StorageContext,
     Document,
     Settings,
+    VectorStoreIndex,
+    ServiceContext
 )
-from llama_index.core.indices import VectorStoreIndex
+from llama_index.core.ingestion import IngestionPipeline, IngestionCache
+from llama_index.core.storage.docstore import SimpleDocumentStore
+from llama_index.core.node_parser import SimpleNodeParser
+from llama_index.core.extractors import (
+    TitleExtractor,
+    KeywordExtractor,
+    QuestionsAnsweredExtractor,
+    SummaryExtractor
+)
+from llama_index.core.text_splitter import TokenTextSplitter
+from llama_index.core import SimpleDirectoryReader
 from llama_index.readers.docling import DoclingReader
 from docling import document_converter
 from llama_index.llms.openai import OpenAI
@@ -43,8 +58,10 @@ def check_environment():
 def configure_llama_index():
     """Configure LlamaIndex settings"""
     check_environment()
-    # Suppress huggingface symlinks warning on Windows
+    # Configure HuggingFace cache and disable symlinks on Windows
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"  # Use HTTPS instead of git
+    os.environ["TRANSFORMERS_CACHE"] = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
     os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
     Settings.llm = OpenAI(model=MODEL_NAME, api_key=OPENAI_API_KEY, temperature=0)
     Settings.embed_model = OpenAIEmbedding(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
@@ -93,145 +110,134 @@ class IngestionWorkflow:
         file_path = ev.file_path
         print(f"[Workflow] chunk_doc: reading from {file_path}")
 
-        # Configure Docling reader
-        doc_converter = document_converter.DocumentConverter()
-        reader = DoclingReader(
-            export_type="markdown",  # Get structured markdown
-            doc_converter=doc_converter,
-            md_export_kwargs={"image_placeholder": ""}  # Skip images
-        )
+        try:
+            # First load the document using LlamaIndex's built-in reader
+            print(f"[Workflow] Loading document: {file_path}")
+            base_reader = SimpleDirectoryReader(
+                input_files=[file_path],
+                filename_as_id=True
+            )
+            raw_docs = base_reader.load_data()
+            
+            if not raw_docs:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No document content could be extracted from the file"
+                )
+            
+            print(f"[Workflow] Initial load successful, parsing with Docling")
+            
+            # Skip Docling for now and use raw documents directly
+            documents = raw_docs
+            
+            print(f"[Workflow] Processing {len(documents)} documents")
+            
+            # Simple node parser for basic text chunking
+            node_parser = SimpleNodeParser.from_defaults(
+                chunk_size=512,  # Smaller chunks for better processing
+                chunk_overlap=50
+            )
+            
+            processed_documents = []
+            for i, doc in enumerate(documents):
+                if not doc or not isinstance(doc.text, str) or not doc.text.strip():
+                    continue
+                
+                try:
+                    # Basic text sanitization
+                    text = doc.text.encode('utf-8', errors='replace').decode('utf-8')
+                    
+                    # Create simple metadata
+                    metadata = {
+                        "doc_id": i,
+                        "filename": os.path.basename(file_path)
+                    }
+                    
+                    # Create document with sanitized text
+                    processed_documents.append(
+                        Document(
+                            text=text,
+                            metadata=metadata
+                        )
+                    )
+                except Exception as e:
+                    print(f"[Workflow] Error processing document {i}: {str(e)}")
+                    continue
+            
+            if not processed_documents:
+                raise HTTPException(
+                    status_code=500,
+                    detail="No valid content could be extracted from the document"
+                )
+            
+            return ChunksReadyEvent(
+                file_path=file_path,
+                collection_name=ev.collection_name,
+                curriculum_id=ev.curriculum_id,
+                documents=processed_documents
+            )
+            
+        except Exception as e:
+            print(f"Error processing document: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Document processing failed: {str(e)}"
+            )
         
-        # Read and process document
-        print(f"[Workflow] Reading document: {file_path}")
-        documents = list(reader.lazy_load_data(file_path))
-        print(f"[Workflow] Extracted {len(documents)} document sections")
-        
-        # Log document structure
-        for i, doc in enumerate(documents):
-            print(f"[Workflow] Document {i+1} metadata: {doc.metadata}")
-            print(f"[Workflow] Document {i+1} preview: {doc.text[:200]}...")
-        
-        return ChunksReadyEvent(
-            file_path=file_path,
-            collection_name=ev.collection_name,
-            curriculum_id=ev.curriculum_id,
-            documents=documents
-        )
 
     async def store_in_vector_db(self, ev: ChunksReadyEvent) -> StoredEvent:
         """
-        Step 2: We retrieve the docs from context, build a VectorStoreIndex with Qdrant.
+        Step 2: Store documents using dual-store pattern (document store + vector store)
         """
         print(f"[Workflow] store_in_vector_db: storing to collection '{ev.collection_name}'")
 
-        # Load environment variables directly from .env
-        from dotenv import dotenv_values
-        env_vars = dotenv_values(".env")
-        url = env_vars["QDRANT_URL"].rstrip('/')  # Remove any trailing slash
-        api_key = env_vars["QDRANT_API_KEY"].strip()  # Remove any whitespace
-        print(f"Connecting to Qdrant at: {url}")
-        print(f"API Key length: {len(api_key)}")
-        print(f"API Key first 10 chars: {api_key[:10]}")
-        
-        # Try with headers
-        client = QdrantClient(
-            url=url,
-            timeout=10,
-            prefer_grpc=False,
-            headers={
-                "api-key": api_key,
-                "Authorization": f"Bearer {api_key}"
-            }
-        )
-
-        # Verify collection exists
-        if not client.collection_exists(ev.collection_name):
-            print(f"Creating collection '{ev.collection_name}'")
-            client.create_collection(
+        try:
+            # Initialize vector store
+            vector_store = QdrantVectorStore(
+                client=qdrant_client_inst,
                 collection_name=ev.collection_name,
-                vectors_config=models.VectorParams(
-                    size=1536,
-                    distance=models.Distance.COSINE,
-                    on_disk=True
-                ),
-                optimizers_config=models.OptimizersConfigDiff(
-                    memmap_threshold=20000
-                ),
-                timeout=30
+                prefer_grpc=False,
+                timeout=10
             )
 
-        # Get embeddings for documents
-        embed_model = OpenAIEmbedding(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
-        
-        # Process each document
-        for i, doc in enumerate(ev.documents):
-            try:
-                # Clean and validate document text
-                print(f"Processing document {i+1}")
-                text = doc.text.strip()
-                if not text:
-                    print(f"Skipping empty document {i+1}")
-                    continue
-                    
-                # Ensure text is valid UTF-8
-                text = text.encode('utf-8', errors='ignore').decode('utf-8')
-                
-                # Split text into chunks of roughly 4000 tokens (half the limit)
-                # Approximate tokens by characters (1 token ≈ 4 chars)
-                chunk_size = 16000  # ~4000 tokens
-                chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
-                print(f"Split document into {len(chunks)} chunks")
-                
-                # Process each chunk
-                for chunk_idx, chunk in enumerate(chunks):
-                    print(f"Getting embedding for chunk {chunk_idx + 1}/{len(chunks)}")
-                    # Get embedding for chunk
-                    embedding = embed_model.get_text_embedding(chunk)
-                    print(f"Embedding generated successfully, length: {len(embedding)}")
-                    
-                    # Convert embedding to numpy array
-                    import numpy as np
-                    embedding_array = np.array(embedding, dtype=np.float32)
-                    
-                    # Print first few values for debugging
-                    print(f"First 5 values of embedding: {embedding_array[:5]}")
-                    print(f"Min value: {embedding_array.min()}, Max value: {embedding_array.max()}")
-                    
-                    # Print chunk info
-                    print(f"Chunk text length: {len(chunk)}")
-                    print(f"Chunk text preview: {chunk[:100]}...")
-                    
-                    # Add point to collection with minimal payload
-                    print(f"Adding point to Qdrant")
-                    vector_list = embedding_array.tolist()
-                    print(f"Vector type after tolist: {type(vector_list)}")
-                    print(f"Vector length after tolist: {len(vector_list)}")
-                    point_id = i * 1000 + chunk_idx  # Unique ID for each chunk
-                    client.upsert(
-                        collection_name=ev.collection_name,
-                        points=[
-                            models.PointStruct(
-                                id=point_id,
-                                vector=vector_list,
-                                payload={
-                                    "text": chunk,
-                                    "doc_id": i,
-                                    "chunk_idx": chunk_idx
-                                }
-                            )
-                        ]
-                    )
-                    print(f"Added chunk {chunk_idx + 1}/{len(chunks)} of document {i+1}/{len(ev.documents)}")
-            except Exception as e:
-                print(f"Error processing document {i+1}: {str(e)}")
-                if hasattr(e, 'response'):
-                    print(f"Response content: {e.response.content}")
-                raise
+            # Initialize document store
+            doc_store = SimpleDocumentStore()
 
-        return StoredEvent(
-            curriculum_id=ev.curriculum_id,
-            message=f"Data stored in Qdrant collection '{ev.collection_name}'"
-        )
+            # Configure settings for document processing
+            Settings.text_splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=50)
+            Settings.node_parser = SimpleNodeParser.from_defaults(
+                chunk_size=512,
+                chunk_overlap=50
+            )
+
+            # Create storage context
+            storage_context = StorageContext.from_defaults(
+                vector_store=vector_store,
+                docstore=doc_store
+            )
+
+            # Create index directly with documents
+            index = VectorStoreIndex.from_documents(
+                documents=ev.documents,
+                storage_context=storage_context,
+                show_progress=True
+            )
+
+            print(f"Debug: Successfully stored {len(ev.documents)} documents with dual storage", file=sys.stderr)
+            
+            return StoredEvent(
+                curriculum_id=ev.curriculum_id,
+                message=f"Data stored in Qdrant collection '{ev.collection_name}'"
+            )
+
+        except Exception as e:
+            print(f"Error storing documents: {str(e)}", file=sys.stderr)
+            if hasattr(e, 'response'):
+                print(f"Response content: {e.response.content}", file=sys.stderr)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to store documents: {str(e)}"
+            )
 
     async def run(self, ev: StartIngestionEvent) -> str:
         """

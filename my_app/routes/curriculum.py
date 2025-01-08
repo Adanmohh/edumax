@@ -25,6 +25,7 @@ from ..workflows.curriculum_discussion_workflow import (
     DiscussionQuery,
     DiscussionResponse
 )
+from ..workflows.curriculum_extraction_workflow import CurriculumExtractionWorkflow
 
 router = APIRouter(prefix="/curriculum", tags=["Curriculum"])
 
@@ -37,16 +38,16 @@ discussion_workflow = CurriculumDiscussionWorkflow()
 async def list_curricula(
     search: Optional[str] = Query(None),
     school_id: Optional[int] = Query(None),
-    session_token: str = Query(...),
+    token: str = Query(...),
     db: Session = Depends(get_db)
 ):
     print("Starting list_curricula endpoint", file=sys.stderr)
     """List curricula with optional search and filtering"""
-    print(f"Debug: Received request - search: {search}, school_id: {school_id}, token: {session_token}")
+    print(f"Debug: Received request - search: {search}, school_id: {school_id}, token: {token}")
     
     try:
-        print(f"Debug: About to check login with token: {session_token}")
-        user = login_required(session_token, db)
+        print(f"Debug: About to check login with token: {token}")
+        user = login_required(token, db)
         print(f"Debug: Login check result: {user}")
         if not user:
             print("Debug: Authentication failed - user not found or invalid token")
@@ -85,10 +86,14 @@ async def list_curricula(
         print(f"Debug: Found {len(curricula)} curricula", file=sys.stderr)
         
         # Convert to response format
+        # Initialize curriculum discussion workflow for context extraction
+        discussion_workflow = CurriculumDiscussionWorkflow()
+        
         curricula_list = []
         for c in curricula:
             print(f"Debug: Processing curriculum {c.id}", file=sys.stderr)
             try:
+                # Base curriculum info
                 curriculum_dict = {
                     "id": c.id,
                     "name": c.name,
@@ -98,6 +103,30 @@ async def list_curricula(
                     "created_at": c.created_at.isoformat() if c.created_at else datetime.utcnow().isoformat(),
                     "has_embeddings": bool(c.vector_key)
                 }
+                
+                # If curriculum has embeddings, extract additional context
+                if c.vector_key:
+                    try:
+                        # Extract context using the curriculum extraction workflow
+                        extraction_workflow = CurriculumExtractionWorkflow()
+                        context = await extraction_workflow.extract_comprehensive_context(
+                            collection_name=c.vector_key,
+                            context_type='course'
+                        )
+                        
+                        # Add extracted context to curriculum dict
+                        curriculum_dict.update({
+                            "description": context.relevant_content,
+                            "learning_objectives": context.learning_objectives,
+                            "key_concepts": context.key_concepts,
+                            "themes": context.themes,
+                            "teaching_approach": context.teaching_approach
+                        })
+                    except Exception as e:
+                        print(f"Debug: Error extracting context for curriculum {c.id}: {str(e)}", file=sys.stderr)
+                        # Continue with basic info if context extraction fails
+                        pass
+                
                 print(f"Debug: Processed curriculum: {curriculum_dict}", file=sys.stderr)
                 curricula_list.append(curriculum_dict)
             except Exception as e:
@@ -116,11 +145,11 @@ async def list_curricula(
 @router.get("/{curriculum_id}")
 async def get_curriculum(
     curriculum_id: int,
-    session_token: str = Query(...),
+    token: str = Query(...),
     db: Session = Depends(get_db)
 ):
     """Get curriculum details"""
-    user = login_required(session_token, db)
+    user = login_required(token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
@@ -147,10 +176,10 @@ async def upload_curriculum(
     file: UploadFile = File(...),
     name: str = Body(...),
     school_id: int = Body(...),
-    session_token: str = Body(...),
+    token: str = Body(...),
     db: Session = Depends(get_db)
 ):
-    user = login_required(session_token, db)
+    user = login_required(token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     if user.role != "superadmin" and user.school_id != school_id:
@@ -186,11 +215,11 @@ async def upload_curriculum(
 @router.delete("/{curriculum_id}")
 async def delete_curriculum(
     curriculum_id: int,
-    session_token: str = Query(...),
+    token: str = Query(...),
     db: Session = Depends(get_db)
 ):
     """Delete a curriculum"""
-    user = login_required(session_token, db)
+    user = login_required(token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
@@ -220,7 +249,7 @@ async def start_ingestion_workflow(
     """
     Trigger the workflow to chunk + store doc in Qdrant.
     """
-    user = login_required(data.session_token, db)
+    user = login_required(data.token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
@@ -293,11 +322,11 @@ async def discuss_curriculum(
     curriculum_id: int = Query(...),
     query: str = Body(...),
     chat_history: List[dict] = Body(default=[]),
-    session_token: str = Body(...),
+    token: str = Body(...),
     db: Session = Depends(get_db)
 ):
     """Start or continue a discussion about a curriculum"""
-    user = login_required(session_token, db)
+    user = login_required(token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 

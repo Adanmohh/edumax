@@ -27,7 +27,7 @@ async def create_course(
     """
     Step 1: Create initial course with basic info
     """
-    user = login_required(data.session_token, db)
+    user = login_required(data.token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
@@ -71,7 +71,7 @@ async def create_course_modules(
     """
     Step 2: Create or update modules for a course
     """
-    user = login_required(data.session_token, db)
+    user = login_required(data.token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
@@ -109,7 +109,7 @@ async def finalize_course(
     """
     Step 3: Finalize the course
     """
-    user = login_required(data.session_token, db)
+    user = login_required(data.token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
@@ -142,16 +142,16 @@ async def finalize_course(
 @router.get("/schools/{school_id}/courses")
 def get_school_courses(
     school_id: int,
-    session_token: str,
+    token: str,
     db: Session = Depends(get_db)
 ):
     """
     Get all courses for a specific school
     """
-    if not session_token:
-        return JSONResponse({"error": "Session token required"}, status_code=400)
+    if not token:
+        return JSONResponse({"error": "Token required"}, status_code=400)
 
-    user = login_required(session_token, db)
+    user = login_required(token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
@@ -181,16 +181,16 @@ def get_school_courses(
 @router.get("/courses/{course_id}")
 def get_course(
     course_id: int,
-    session_token: str = None,
+    token: str = None,
     db: Session = Depends(get_db)
 ):
     """
     Get course details including modules and lessons
     """
-    if not session_token:
-        return JSONResponse({"error": "Session token required"}, status_code=400)
+    if not token:
+        return JSONResponse({"error": "Token required"}, status_code=400)
 
-    user = login_required(session_token, db)
+    user = login_required(token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 

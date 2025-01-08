@@ -3,7 +3,10 @@ import os
 import sys
 from fastapi import FastAPI
 from my_app.database import Base, engine
-from my_app.routes import auth_router, schools_router, curriculum_router, courses_router
+from my_app.routes import (
+    auth_router, schools_router, curriculum_router, courses_router,
+    enhanced_courses
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import traceback
@@ -100,6 +103,7 @@ app.include_router(auth_router, prefix="/auth")
 app.include_router(schools_router)
 app.include_router(curriculum_router)
 app.include_router(courses_router)
+app.include_router(enhanced_courses.router, tags=["Enhanced Courses"])
 
 if __name__ == "__main__":
     import uvicorn

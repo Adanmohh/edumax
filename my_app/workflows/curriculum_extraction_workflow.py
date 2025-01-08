@@ -7,8 +7,12 @@ from llama_index.core import (
     VectorStoreIndex,
     StorageContext,
     Settings,
-    Response
+    Response,
+    ServiceContext
 )
+from llama_index.core.storage.docstore import SimpleDocumentStore
+from llama_index.core.node_parser import SimpleNodeParser
+from llama_index.core.text_splitter import TokenTextSplitter
 from llama_index.llms.openai import OpenAI
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
@@ -50,15 +54,27 @@ class CurriculumExtractionWorkflow:
                 detail="Missing required environment variables"
             )
         
-        Settings.llm = OpenAI(model=MODEL_NAME, api_key=OPENAI_API_KEY)
-        Settings.embed_model = OpenAIEmbedding(model=EMBEDDING_MODEL, api_key=OPENAI_API_KEY)
+        # Configure OpenAI models with specific parameters
+        Settings.llm = OpenAI(
+            model=MODEL_NAME,
+            api_key=OPENAI_API_KEY,
+            temperature=0.0,  # Deterministic output
+            max_tokens=1500,  # Longer responses
+            timeout=60  # Longer timeout
+        )
+        Settings.embed_model = OpenAIEmbedding(
+            model=EMBEDDING_MODEL,
+            api_key=OPENAI_API_KEY,
+            embed_batch_size=100  # Process more text at once
+        )
+        print("Debug: OpenAI models configured", file=sys.stderr)
         
         self.current_collection = None
         self.index = None
         self.query_cache = {}
 
     def load_index(self, collection_name: str):
-        """Load and validate vector store index"""
+        """Load and validate vector store index with dual storage setup"""
         try:
             print(f"Debug: Starting load_index for collection: {collection_name}", file=sys.stderr)
             
@@ -76,20 +92,49 @@ class CurriculumExtractionWorkflow:
                 else:
                     raise HTTPException(status_code=500, detail=message)
 
+            # Initialize vector store with proper configuration
             vector_store = QdrantVectorStore(
                 client=qdrant_client_inst,
-                collection_name=collection_name
+                collection_name=collection_name,
+                prefer_grpc=False,
+                timeout=10
             )
             
+            # Initialize document store
+            doc_store = SimpleDocumentStore()
+            
+            # Create storage context with both stores
             storage_context = StorageContext.from_defaults(
+                docstore=doc_store,
                 vector_store=vector_store
             )
             
+            # Configure settings for document processing
+            Settings.text_splitter = TokenTextSplitter(chunk_size=512, chunk_overlap=50)
+            Settings.node_parser = SimpleNodeParser.from_defaults(
+                chunk_size=512,
+                chunk_overlap=50
+            )
+            
+            # Create index from vector store
             self.index = VectorStoreIndex.from_vector_store(
                 vector_store,
-                storage_context=storage_context
+                storage_context=storage_context,
+                show_progress=True,
+                use_async=True
             )
-
+            
+            # Ensure index is properly initialized
+            if not self.index:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to initialize index from vector store"
+                )
+                
+            # Initialize the retriever
+            self.index._retriever = self.index.as_retriever()
+            
+            # Verify index is initialized
             if not self.index:
                 raise HTTPException(
                     status_code=500,
@@ -97,7 +142,7 @@ class CurriculumExtractionWorkflow:
                 )
             
             self.current_collection = collection_name
-            print("Debug: Successfully loaded index", file=sys.stderr)
+            print("Debug: Successfully loaded index with dual storage", file=sys.stderr)
 
         except HTTPException as he:
             raise he
@@ -107,14 +152,29 @@ class CurriculumExtractionWorkflow:
                 detail=f"Failed to load curriculum index: {str(e)}"
             )
 
-    async def _execute_query(self, query_engine, query: str, cache_key: str = None) -> str:
+    async def _execute_query(self, query_engine, query: str, cache_key: str = None, metadata_filters: dict = None) -> str:
         """Execute query with caching"""
         try:
             if cache_key and cache_key in self.query_cache:
                 print(f"Debug: Cache hit for {cache_key}", file=sys.stderr)
                 return self.query_cache[cache_key]
             
-            response = await query_engine.aquery(query)
+            print(f"Debug: Executing query: {query}", file=sys.stderr)
+            
+            # Apply filters to the query engine's retriever if needed
+            if metadata_filters and hasattr(query_engine.retriever, 'filters'):
+                query_engine.retriever.filters = metadata_filters
+                print(f"Debug: Applied filters: {metadata_filters}", file=sys.stderr)
+            
+            try:
+                response = await query_engine.aquery(query)
+                print(f"Debug: Raw response: {response}", file=sys.stderr)
+            finally:
+                # Reset filters after query
+                if metadata_filters and hasattr(query_engine.retriever, 'filters'):
+                    query_engine.retriever.filters = None
+            print(f"Debug: Query response received", file=sys.stderr)
+            
             if not response:
                 raise HTTPException(
                     status_code=500,
@@ -163,54 +223,89 @@ class CurriculumExtractionWorkflow:
             if not self.index or self.current_collection != collection_name:
                 self.load_index(collection_name)
 
-            query_engine = self.index.as_query_engine(
-                similarity_top_k=8,
-                response_mode="tree_summarize",
-                streaming=False
-            )
+            # Configure query engine
+            if not self.index:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Index not initialized"
+                )
 
-            # Basic context queries
+            # Configure custom retriever
+            from llama_index.core.retrievers import VectorIndexRetriever
+            
+            retriever = VectorIndexRetriever(
+                index=self.index,
+                similarity_top_k=5  # Number of chunks to retrieve
+            )
+            
+            # Create query engine with custom retriever and response synthesis
+            query_engine = self.index.as_query_engine(
+                retriever=retriever,
+                response_mode="tree_summarize",  # More robust response synthesis
+                node_postprocessors=[],  # Remove postprocessors for now
+                verbose=True,  # Enable verbose mode for debugging
+                use_async=True,  # Enable async mode
+                similarity_top_k=5,  # Consistent with retriever setting
+                streaming=False  # Disable streaming for better error handling
+            )
+            
+            if not query_engine:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Failed to initialize query engine"
+                )
+            
+            print("Debug: Query engine initialized with custom retriever", file=sys.stderr)
+
+            # Enhanced context queries with metadata filtering
             objectives = await self._execute_query(
                 query_engine,
-                "What are the main learning objectives and outcomes? List them.",
-                f"{collection_name}_objectives"
+                "Extract and list the main learning objectives and outcomes. Focus on measurable and actionable objectives.",
+                f"{collection_name}_objectives",
+                {"keywords": ["objective", "outcome", "goal"]}
             )
             
             concepts = await self._execute_query(
                 query_engine,
-                "What are the key concepts and terminology covered? List them.",
-                f"{collection_name}_concepts"
+                "Identify and explain key concepts, terminology, and their relationships. Include definitions where available.",
+                f"{collection_name}_concepts",
+                {"keywords": ["concept", "term", "definition"]}
             )
             
             skill_level = await self._execute_query(
                 query_engine,
-                "What is the skill level or difficulty of this material?",
-                f"{collection_name}_skill_level"
+                "Analyze the skill level and prerequisites. Consider progression of difficulty and prior knowledge requirements.",
+                f"{collection_name}_skill_level",
+                {"keywords": ["prerequisite", "difficulty", "level"]}
             )
 
-            # Enhanced context queries
+            # Enhanced context queries with advanced prompting
             themes = await self._execute_query(
                 query_engine,
-                "What are the main themes and topics? How do they connect?",
-                f"{collection_name}_themes"
+                "Analyze the main themes and their interconnections. Identify overarching patterns and relationships between topics.",
+                f"{collection_name}_themes",
+                {"keywords": ["theme", "topic", "subject"]}
             )
             
             progression = await self._execute_query(
                 query_engine,
-                "Describe the learning progression and knowledge building sequence.",
-                f"{collection_name}_progression"
+                "Map the learning progression and knowledge building sequence. Include dependencies and recommended order.",
+                f"{collection_name}_progression",
+                {"keywords": ["sequence", "progression", "order"]}
             )
             
             approach = await self._execute_query(
                 query_engine,
-                "What teaching approaches and methodologies are recommended?",
-                f"{collection_name}_approach"
+                "Evaluate recommended teaching approaches and methodologies. Include practical implementation suggestions.",
+                f"{collection_name}_approach",
+                {"keywords": ["method", "approach", "strategy"]}
             )
             
             competencies = await self._execute_query(
                 query_engine,
-                "What core competencies should students develop?",
-                f"{collection_name}_competencies"
+                "Identify core competencies and skills students should develop. Include both technical and soft skills.",
+                f"{collection_name}_competencies",
+                {"keywords": ["competency", "skill", "ability"]}
             )
 
             # Context-specific query

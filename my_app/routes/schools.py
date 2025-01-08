@@ -14,7 +14,7 @@ def create_school(
     data: SchoolCreate,
     db: Session = Depends(get_db)
 ):
-    user = login_required(data.session_token, db)
+    user = login_required(data.token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
     if user.role != "superadmin":
@@ -28,12 +28,12 @@ def create_school(
 
 @router.get("/schools")
 def list_schools(
-    session_token: str = None,
+    token: str = None,
     db: Session = Depends(get_db)
 ):
-    if not session_token:
-        return JSONResponse({"error": "Session token required"}, status_code=400)
-    user = login_required(session_token, db)
+    if not token:
+        return JSONResponse({"error": "Token required"}, status_code=400)
+    user = login_required(token, db)
     if not user:
         return JSONResponse({"error": "Not logged in"}, status_code=401)
 
